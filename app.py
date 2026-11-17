@@ -5,9 +5,9 @@ import sqlite3
 from datetime import datetime, timezone
 import math
 
-st.set_page_config(page_title="NOX AUTO TRADER 3.7", page_icon="📈", layout="wide")
-st.title("📈 NOX AUTO TRADER 3.7")
-st.caption("Selective crypto scalping · 15 spot pairs · pullback confirmation · net-cost filter · 500 SEK · max 2% risk")
+st.set_page_config(page_title="NOX AUTO TRADER 3.8", page_icon="📈", layout="wide")
+st.title("📈 NOX AUTO TRADER 3.8 – Signal Diagnostics")
+st.caption("Selective crypto scalping · 15 spot pairs · unchanged entry rules · explainable wait reasons · 500 SEK · max 2% risk")
 st.warning("PAPER TRADING ENDAST. Inga riktiga order eller pengar används. Selektiv scalping med 1m-rekylbekräftelse och 5m-trendfilter. Nettomål kontrolleras mot avgifter och uppskattad slippage. Ingen lönsamhet är garanterad.")
 
 # Risk and execution assumptions
@@ -28,8 +28,8 @@ MAX_ATR_PCT = 0.012
 MIN_NOTIONAL_SEK = 40.0
 MAX_HOLD_MINUTES = 90
 
-DB = "nox_v37_paper.sqlite"  # Fresh 3.7 paper account; prior paper history is kept separate
-HEADERS = {"User-Agent": "Mozilla/5.0 NOX-Auto-Trader/3.7"}
+DB = "nox_v37_paper.sqlite"  # Fresh 3.8 paper account; prior paper history is kept separate
+HEADERS = {"User-Agent": "Mozilla/5.0 NOX-Auto-Trader/3.8"}
 OKX_URL = "https://www.okx.com/api/v5/market/candles"
 BYBIT_URL = "https://api.bybit.com/v5/market/kline"
 FX_URL = "https://open.er-api.com/v6/latest/USD"
@@ -214,9 +214,28 @@ def analyze(d):
     eligible = (htf_up and pullback_reclaim and price > e9.iloc[-1] and rsi_value is not None
                 and 50 <= rsi_value <= 67 and extension_atr <= MAX_EXTENSION_ATR
                 and atr_pct <= MAX_ATR_PCT and momentum > 0)
+    raw_score = int(score)
     if not eligible:
         score = min(score, 79)
-    return price, int(score), rsi_value, atr_value, str(d.iloc[-1]["ts"])
+    checks = {
+        "5m upptrend": htf_up,
+        "Rekyl + reclaim": pullback_reclaim,
+        "Pris över EMA9": price > float(e9.iloc[-1]),
+        "RSI 50–67": rsi_value is not None and 50 <= rsi_value <= 67,
+        "Positivt momentum": momentum > 0,
+        "Inte översträckt": extension_atr <= MAX_EXTENSION_ATR,
+        "Volatilitet OK": atr_pct <= MAX_ATR_PCT,
+        "Signal ≥80": int(score) >= SIGNAL_THRESHOLD,
+    }
+    metrics = {
+        "RSI": round(rsi_value, 1) if rsi_value is not None else None,
+        "Momentum %": round(momentum, 3),
+        "Avstånd EMA9 (ATR)": round(extension_atr, 2),
+        "ATR %": round(atr_pct * 100, 3),
+        "Volymkvot": round(vol_ratio, 2),
+        "Råpoäng": raw_score,
+    }
+    return price, int(score), rsi_value, atr_value, str(d.iloc[-1]["ts"]), checks, metrics
 
 def account():
     return conn.execute("SELECT cash,realized FROM account WHERE id=1").fetchone()
@@ -356,20 +375,38 @@ def scan_cycle():
     for inst,symbol in CRYPTO:
         try:
             d,provider=get_crypto(inst,symbol)
-            price,score,rsi,atr,candle=analyze(d)
+            price,score,rsi,atr,candle,checks,metrics=analyze(d)
+            # Estimated net reward/risk uses the same assumptions as execution.
+            stop_distance = max(STOP_ATR * atr, price * 0.002)
+            roundtrip_cost_pct = (2 * FEE_RATE) + ESTIMATED_SLIPPAGE_ROUNDTRIP
+            net_reward = stop_distance * TARGET_R - price * roundtrip_cost_pct
+            net_risk = stop_distance + price * roundtrip_cost_pct
+            net_rr = net_reward / net_risk if net_risk > 0 else 0.0
+            checks["Netto-R/R ≥1,10"] = net_rr >= MIN_NET_REWARD_R
+            blockers = [name for name, passed in checks.items() if not passed]
             action="Avvakta"
-            if score >= SIGNAL_THRESHOLD:
+            if score >= SIGNAL_THRESHOLD and all(checks.values()):
                 action=open_position(symbol,price,atr,fx,score,candle)
                 if action.startswith("Paper BUY"):
                     events.append(action)
                 elif action not in ("Position finns redan","Redan handlad denna minut","Redan öppnad på denna stapel"):
                     events.append(f"{symbol}: {action}")
+            if action == "Avvakta":
+                reason_text = ", ".join(blockers) if blockers else "Övrig exekveringskontroll"
+            else:
+                reason_text = action
+            check_text = " | ".join(("✓ " if passed else "✗ ") + name for name, passed in checks.items())
             rows.append({"Instrument":symbol,"Källa":provider,"Pris (USDT)":price,
-                "Signal":score,"RSI":round(rsi,1) if rsi is not None else None,
-                "Senaste stängda 1m-stapel":candle,"Åtgärd":action,"Data":"OK"})
+                "Signal":score,"Råpoäng":metrics["Råpoäng"],"RSI":round(rsi,1) if rsi is not None else None,
+                "Netto-R/R":round(net_rr,2),"Åtgärd":action,"Varför avvaktar":reason_text,
+                "Kontroller":check_text,"Momentum %":metrics["Momentum %"],
+                "Avstånd EMA9 (ATR)":metrics["Avstånd EMA9 (ATR)"],"ATR %":metrics["ATR %"],
+                "Volymkvot":metrics["Volymkvot"],
+                "Senaste stängda 1m-stapel":candle,"Data":"OK"})
         except Exception as e:
             rows.append({"Instrument":symbol,"Källa":"—","Pris (USDT)":None,"Signal":None,
-                "RSI":None,"Senaste stängda 1m-stapel":"—","Åtgärd":"—","Data":str(e)[:120]})
+                "RSI":None,"Netto-R/R":None,"Åtgärd":"—","Varför avvaktar":"Datafel – ingen signalbedömning",
+                "Kontroller":"—","Senaste stängda 1m-stapel":"—","Data":str(e)[:120]})
     return rows,events,fx
 
 # Sidebar controls
@@ -408,7 +445,7 @@ def render_live_summary(fx=None, rows=None):
     c4.metric("Realiserat resultat",f"{realized:+.2f} kr")
     c5.metric("Öppen planerad risk",f"{total_open_risk:.2f} kr")
 
-st.info("NOX 3.7: 1m pullback/reclaim krävs (föregående rekyl mot EMA9 och stängning över föregående stapels high), tillsammans med 5m upptrend, RSI 50–67, positivt momentum och skydd mot översträckta/volatila inträden. Köp kräver signal ≥80/100 samt uppskattad netto-R/R ≥1,10 efter 0,10 % avgift per sida och 0,05 % uppskattad round-trip slippage. Stop/target kontrolleras mot candle high/low; om båda träffas i samma stapel räknas stop-loss först.")
+st.info("NOX 3.8: samma köpkrav som 3.7; diagnostik visar varför varje instrument avvaktar. 1m pullback/reclaim krävs (föregående rekyl mot EMA9 och stängning över föregående stapels high), tillsammans med 5m upptrend, RSI 50–67, positivt momentum och skydd mot översträckta/volatila inträden. Köp kräver signal ≥80/100 samt uppskattad netto-R/R ≥1,10 efter 0,10 % avgift per sida och 0,05 % uppskattad round-trip slippage. Stop/target kontrolleras mot candle high/low; om båda träffas i samma stapel räknas stop-loss först.")
 if "last_rows" not in st.session_state: st.session_state.last_rows=[]
 if "last_events" not in st.session_state: st.session_state.last_events=[]
 if "last_cycle" not in st.session_state: st.session_state.last_cycle="Ingen cykel ännu"
@@ -432,6 +469,12 @@ if auto:
         if st.session_state.last_rows:
             st.subheader("Krypto – automatisk paper trading")
             st.dataframe(pd.DataFrame(st.session_state.last_rows),use_container_width=True,hide_index=True)
+            st.subheader("Varför köper inte NOX?")
+            diagnostic_rows = [r for r in st.session_state.last_rows if r.get("Data") == "OK"]
+            if diagnostic_rows:
+                near = [r for r in diagnostic_rows if r.get("Råpoäng", 0) >= 65]
+                st.caption(f"{len(near)} av {len(diagnostic_rows)} instrument har råpoäng ≥65. Köpkraven är oförändrade; detta är endast diagnostik.")
+                st.dataframe(pd.DataFrame([{"Instrument":r["Instrument"],"Signal":r.get("Signal"),"Råpoäng":r.get("Råpoäng"),"Netto-R/R":r.get("Netto-R/R"),"Varför avvaktar":r.get("Varför avvaktar"),"Kontroller":r.get("Kontroller")} for r in diagnostic_rows]),use_container_width=True,hide_index=True)
         current=pd.read_sql_query("SELECT symbol,qty,entry_sek,stop_sek,target_sek,risk_sek,opened_utc FROM positions WHERE status='OPEN'",conn)
         st.subheader("Öppna paper-positioner")
         if current.empty: st.write("Inga öppna positioner. NOX väntar på kvalificerade signaler.")
