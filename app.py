@@ -5,15 +5,15 @@ import sqlite3
 from datetime import datetime, timezone
 import math
 
-st.set_page_config(page_title="NOX AUTO TRADER 3.3", page_icon="📈", layout="wide")
-st.title("📈 NOX AUTO TRADER 3.3")
-st.caption("Crypto-first automated PAPER trading · 1-minute monitoring · 500 SEK · No leverage")
+st.set_page_config(page_title="NOX AUTO TRADER 3.4", page_icon="📈", layout="wide")
+st.title("📈 NOX AUTO TRADER 3.4")
+st.caption("Crypto-first automated PAPER trading · 1-minute monitoring · 500 SEK · 2% risk · No leverage")
 st.warning("PAPER TRADING ENDAST. Inga riktiga order eller pengar används. Första automatiska paper-versionen handlar endast krypto där pris- och valutaberäkningen kan kontrolleras. Aktier, forex och råvaror är fortsatt signalbevakning.")
 
 # Risk and execution assumptions
 START_CASH = 500.0
-RISK_FRACTION = 0.01
-MAX_OPEN = 2
+RISK_FRACTION = 0.02
+MAX_OPEN = 4
 MAX_NOTIONAL_FRACTION = 0.25
 FEE_RATE = 0.001       # illustrative paper fee per side
 STOP_ATR = 1.5
@@ -22,8 +22,8 @@ SIGNAL_THRESHOLD = 80
 MIN_NOTIONAL_SEK = 20.0
 MAX_HOLD_MINUTES = 90
 
-DB = "nox_v33_paper.sqlite"
-HEADERS = {"User-Agent": "Mozilla/5.0 NOX-Auto-Trader/3.3"}
+DB = "nox_v33_paper.sqlite"  # Keep existing paper account and open positions
+HEADERS = {"User-Agent": "Mozilla/5.0 NOX-Auto-Trader/3.4"}
 OKX_URL = "https://www.okx.com/api/v5/market/candles"
 BYBIT_URL = "https://api.bybit.com/v5/market/kline"
 FX_URL = "https://open.er-api.com/v6/latest/USD"
@@ -281,24 +281,38 @@ def scan_cycle():
 with st.sidebar:
     st.header("Inställningar")
     st.metric("Startkapital", "500 kr")
-    st.metric("Risk per affär", "1 % av aktuellt eget kapital")
+    st.metric("Risk per affär", "2 % av aktuellt eget kapital")
     st.metric("Max öppna positioner", MAX_OPEN)
     st.metric("Simulerad avgift", "0,10 % per sida")
     auto=st.toggle("Automatisk paper trading varje minut", value=True)
-    st.caption("Krypto spot LONG-only. Ingen hävstång. Högst 25 % av kapitalet i en position.")
+    st.caption("Krypto spot LONG-only. Ingen hävstång. Högst 25 % av kapitalet i en position. Maximal planerad sammanlagd risk kan bli 8 % när fyra positioner är öppna.")
     st.caption("Appen måste vara aktiv. Streamlit Cloud garanterar inte 24/7-drift.")
 
-cash,realized=account()
-open_df=pd.read_sql_query("SELECT symbol,qty,entry_sek,stop_sek,target_sek,risk_sek,opened_utc FROM positions WHERE status='OPEN'",conn)
-open_cost=float(conn.execute("SELECT COALESCE(SUM(notional_sek+entry_fee_sek),0) FROM positions WHERE status='OPEN'").fetchone()[0])
-equity=cash+open_cost
-c1,c2,c3,c4=st.columns(4)
-c1.metric("Kontanter",f"{cash:.2f} kr")
-c2.metric("Portföljvärde (förenklat)",f"{equity:.2f} kr")
-c3.metric("Öppna paper-positioner",len(open_df))
-c4.metric("Realiserat resultat",f"{realized:+.2f} kr")
+def render_live_summary(fx=None, rows=None):
+    cash, realized = account()
+    positions = conn.execute(
+        "SELECT symbol, qty, entry_usdt, entry_fee_sek FROM positions WHERE status='OPEN'"
+    ).fetchall()
+    price_map = {r.get("Instrument"): r.get("Pris (USDT)") for r in (rows or []) if r.get("Pris (USDT)") is not None}
+    market_value = 0.0
+    for symbol, qty, entry_usdt, entry_fee in positions:
+        mark = price_map.get(symbol, entry_usdt)
+        if fx is None:
+            market_value += qty * entry_usdt * 10.0
+        else:
+            market_value += qty * float(mark) * fx
+    equity = cash + market_value
+    total_open_risk = float(conn.execute(
+        "SELECT COALESCE(SUM(risk_sek),0) FROM positions WHERE status='OPEN'"
+    ).fetchone()[0])
+    c1,c2,c3,c4,c5=st.columns(5)
+    c1.metric("Kontanter",f"{cash:.2f} kr")
+    c2.metric("Portföljvärde (mark-to-market)",f"{equity:.2f} kr")
+    c3.metric("Öppna paper-positioner",len(positions))
+    c4.metric("Realiserat resultat",f"{realized:+.2f} kr")
+    c5.metric("Öppen planerad risk",f"{total_open_risk:.2f} kr")
 
-st.info("Automatisk paper trading är aktiverad som standard. Nya köp kräver signal ≥80/100, bekräftad stängd 1m-stapel, max 1 % riskbudget och tillgängligt kapital. Endast krypto öppnar positioner i denna första version.")
+st.info("Automatisk paper trading är aktiverad som standard. Nya köp kräver signal ≥80/100, bekräftad stängd 1m-stapel, max 2 % riskbudget per affär och tillgängligt kapital. Högst fyra positioner. Endast krypto öppnar positioner.")
 if "last_rows" not in st.session_state: st.session_state.last_rows=[]
 if "last_events" not in st.session_state: st.session_state.last_events=[]
 if "last_cycle" not in st.session_state: st.session_state.last_cycle="Ingen cykel ännu"
@@ -315,6 +329,7 @@ if auto:
     def live_engine():
         run_cycle()
         st.caption(f"Senaste automatikcykel: {st.session_state.last_cycle} · USD/SEK: {st.session_state.get('last_fx')}")
+        render_live_summary(st.session_state.get("last_fx"), st.session_state.last_rows)
         if st.session_state.last_events:
             for e in st.session_state.last_events[-8:]:
                 st.write("• "+e)
@@ -334,10 +349,13 @@ else:
     if st.button("▶ Kör en paper trading-cykel",type="primary"):
         run_cycle()
     if st.session_state.last_rows:
+        render_live_summary(st.session_state.get("last_fx"), st.session_state.last_rows)
         st.dataframe(pd.DataFrame(st.session_state.last_rows),use_container_width=True,hide_index=True)
+    else:
+        render_live_summary(None, [])
     st.write("Automatiken är pausad. Aktivera reglaget för minutvis bevakning.")
 
 st.subheader("Övriga marknader – endast signalbevakning")
 st.write("Aktier, forex och råvaror är ännu inte kopplade till automatisk paper-exekvering. Vi aktiverar dem först när valutakonvertering, kontraktsstorlekar och handelsvillkor har verifierats.")
 
-st.caption("VIKTIGT: SQLite-filen ligger på Streamlit-appens filsystem och kan försvinna vid omstart/omdeploy. Detta är en testmiljö, inte en beständig handelsjournal. Avgift 0,10 % per sida är ett förenklat antagande; spread/slippage modelleras inte. Testa under uppsikt innan du drar slutsatser.")
+st.caption("VIKTIGT: 2 % risk per affär innebär 10 kr planerad risk vid 500 kr eget kapital. Fyra samtidiga positioner kan innebära upp till 40 kr (8 %) sammanlagd planerad risk. SQLite-filen ligger på Streamlit-appens filsystem och kan försvinna vid omstart/omdeploy. Detta är en testmiljö, inte en beständig handelsjournal. Avgift 0,10 % per sida är ett förenklat antagande; spread/slippage modelleras inte. Testa under uppsikt innan du drar slutsatser.")
