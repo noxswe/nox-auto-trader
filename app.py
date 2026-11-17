@@ -5,9 +5,9 @@ import sqlite3
 from datetime import datetime, timezone
 import math
 
-st.set_page_config(page_title="NOX AUTO TRADER 3.8", page_icon="📈", layout="wide")
-st.title("📈 NOX AUTO TRADER 3.8 – Signal Diagnostics")
-st.caption("Selective crypto scalping · 15 spot pairs · unchanged entry rules · explainable wait reasons · 500 SEK · max 2% risk")
+st.set_page_config(page_title="NOX AUTO TRADER 3.9", page_icon="📈", layout="wide")
+st.title("📈 NOX AUTO TRADER 3.9 – Active Scalping")
+st.caption("Selective crypto scalping · 15 spot pairs · moderately relaxed entry rules · explainable wait reasons · 500 SEK · max 2% risk")
 st.warning("PAPER TRADING ENDAST. Inga riktiga order eller pengar används. Selektiv scalping med 1m-rekylbekräftelse och 5m-trendfilter. Nettomål kontrolleras mot avgifter och uppskattad slippage. Ingen lönsamhet är garanterad.")
 
 # Risk and execution assumptions
@@ -23,7 +23,7 @@ ESTIMATED_SLIPPAGE_ROUNDTRIP = 2 * ESTIMATED_SLIPPAGE_PER_SIDE
 MIN_NET_REWARD_R = 1.10
 SIGNAL_THRESHOLD = 80
 COOLDOWN_AFTER_STOP_MIN = 5
-MAX_EXTENSION_ATR = 0.8
+MAX_EXTENSION_ATR = 1.0
 MAX_ATR_PCT = 0.012
 MIN_NOTIONAL_SEK = 40.0
 MAX_HOLD_MINUTES = 90
@@ -185,8 +185,9 @@ def analyze(d):
     c5 = five["close"].astype(float)
     ema5_fast = c5.ewm(span=9, adjust=False).mean()
     ema5_slow = c5.ewm(span=21, adjust=False).mean()
-    htf_up = bool(ema5_fast.iloc[-1] > ema5_slow.iloc[-1] and c5.iloc[-1] > ema5_fast.iloc[-1]
-                  and ema5_fast.iloc[-1] >= ema5_fast.iloc[-2])
+    # Moderately relaxed higher-timeframe trend: fast EMA above slow EMA
+    # and price above fast EMA. Do not additionally require EMA slope to rise.
+    htf_up = bool(ema5_fast.iloc[-1] > ema5_slow.iloc[-1] and c5.iloc[-1] > ema5_fast.iloc[-1])
 
     vol = pd.to_numeric(d["volume"], errors="coerce").fillna(0)
     vol_base = float(vol.iloc[-21:-1].median()) if len(vol) >= 22 else 0.0
@@ -194,25 +195,32 @@ def analyze(d):
     momentum = float((c.iloc[-1] / c.iloc[-4] - 1) * 100) if len(c) >= 4 and c.iloc[-4] else 0.0
     extension_atr = (price - float(e9.iloc[-1])) / atr_value if atr_value > 0 else 999.0
     atr_pct = atr_value / price if price > 0 else 999.0
-    # Entry must show a recent pullback toward EMA9 followed by a close above
-    # the previous candle high: avoid buying merely because price is already rising.
-    prev_low = float(d["low"].iloc[-2])
+    # Entry must show a pullback toward EMA9 within the last three completed
+    # candles, followed by a close above the immediately preceding candle high.
+    # This is less restrictive than requiring the pullback on only candle -2.
+    recent_pullback = False
+    for lookback in (2, 3, 4):
+        if len(d) > lookback:
+            recent_low = float(d["low"].iloc[-lookback])
+            recent_ema9 = float(e9.iloc[-lookback])
+            if recent_low <= recent_ema9 + 0.30 * atr_value:
+                recent_pullback = True
+                break
     prev_high = float(d["high"].iloc[-2])
-    prev_ema9 = float(e9.iloc[-2])
-    pullback_reclaim = bool(prev_low <= prev_ema9 + 0.15 * atr_value and price > prev_high)
+    pullback_reclaim = bool(recent_pullback and price > prev_high)
 
     score = 0
     if e9.iloc[-1] > e21.iloc[-1]: score += 25
     if price > e9.iloc[-1]: score += 15
     if htf_up: score += 30
-    if rsi_value is not None and 50 <= rsi_value <= 67: score += 15
+    if rsi_value is not None and 48 <= rsi_value <= 70: score += 15
     if momentum > 0: score += 5
     if vol_ratio >= 1.10: score += 10
     if pullback_reclaim: score += 10
 
     # Hard safety gates: trend, pullback/reclaim, no overheated or extreme-volatility entries.
     eligible = (htf_up and pullback_reclaim and price > e9.iloc[-1] and rsi_value is not None
-                and 50 <= rsi_value <= 67 and extension_atr <= MAX_EXTENSION_ATR
+                and 48 <= rsi_value <= 70 and extension_atr <= MAX_EXTENSION_ATR
                 and atr_pct <= MAX_ATR_PCT and momentum > 0)
     raw_score = int(score)
     if not eligible:
@@ -221,7 +229,7 @@ def analyze(d):
         "5m upptrend": htf_up,
         "Rekyl + reclaim": pullback_reclaim,
         "Pris över EMA9": price > float(e9.iloc[-1]),
-        "RSI 50–67": rsi_value is not None and 50 <= rsi_value <= 67,
+        "RSI 48–70": rsi_value is not None and 48 <= rsi_value <= 70,
         "Positivt momentum": momentum > 0,
         "Inte översträckt": extension_atr <= MAX_EXTENSION_ATR,
         "Volatilitet OK": atr_pct <= MAX_ATR_PCT,
@@ -445,7 +453,7 @@ def render_live_summary(fx=None, rows=None):
     c4.metric("Realiserat resultat",f"{realized:+.2f} kr")
     c5.metric("Öppen planerad risk",f"{total_open_risk:.2f} kr")
 
-st.info("NOX 3.8: samma köpkrav som 3.7; diagnostik visar varför varje instrument avvaktar. 1m pullback/reclaim krävs (föregående rekyl mot EMA9 och stängning över föregående stapels high), tillsammans med 5m upptrend, RSI 50–67, positivt momentum och skydd mot översträckta/volatila inträden. Köp kräver signal ≥80/100 samt uppskattad netto-R/R ≥1,10 efter 0,10 % avgift per sida och 0,05 % uppskattad round-trip slippage. Stop/target kontrolleras mot candle high/low; om båda träffas i samma stapel räknas stop-loss först.")
+st.info("NOX 3.9: något mer aktiv ingångsmodell. Rekyl mot EMA9 får ske under någon av de tre senaste stängda 1m-staplarna, följt av stängning över föregående stapels high. 5m-trend kräver EMA9 över EMA21 och pris över EMA9, utan extra krav på stigande EMA9. RSI 48–70. Signal ≥80/100, positivt momentum, skydd mot översträckta/volatila inträden och uppskattad netto-R/R ≥1,10 efter avgifter/slippage kvarstår. Endast paper trading; ingen lönsamhet garanteras.")
 if "last_rows" not in st.session_state: st.session_state.last_rows=[]
 if "last_events" not in st.session_state: st.session_state.last_events=[]
 if "last_cycle" not in st.session_state: st.session_state.last_cycle="Ingen cykel ännu"
@@ -518,4 +526,4 @@ else:
 st.subheader("Övriga marknader – endast signalbevakning")
 st.write("Aktier, forex och råvaror är ännu inte kopplade till automatisk paper-exekvering. Vi aktiverar dem först när valutakonvertering, kontraktsstorlekar och handelsvillkor har verifierats.")
 
-st.caption("VIKTIGT: 2 % motsvarar 10 kr planerad maxrisk vid 500 kr eget kapital, inklusive uppskattad round-trip-kostnad. Utan hävstång och med max 45 % kapital per position kan faktisk risk bli lägre än 10 kr. Två samtidiga positioner kan tillsammans ha upp till 20 kr planerad risk. Avgift 0,10 % per sida och uppskattad slippage 0,025 % per sida är antaganden, inte garanterade verkliga kostnader; spread och orderboksdjup mäts inte. SQLite-filen kan försvinna vid omstart/omdeploy. Detta är en testmiljö, inte en beständig handelsjournal. Testa under uppsikt och dra inga lönsamhetsslutsatser från få affärer.")
+st.caption("VIKTIGT: 3.9 har något bredare ingångsfilter men behåller riskramarna. 2 % motsvarar 10 kr planerad maxrisk vid 500 kr eget kapital, inklusive uppskattad round-trip-kostnad. Utan hävstång och med max 45 % kapital per position kan faktisk risk bli lägre än 10 kr. Två samtidiga positioner kan tillsammans ha upp till 20 kr planerad risk. Avgift 0,10 % per sida och uppskattad slippage 0,025 % per sida är antaganden, inte garanterade verkliga kostnader; spread och orderboksdjup mäts inte. SQLite-filen kan försvinna vid omstart/omdeploy. Detta är en testmiljö, inte en beständig handelsjournal. Testa under uppsikt och dra inga lönsamhetsslutsatser från få affärer.")
