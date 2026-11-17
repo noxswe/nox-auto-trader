@@ -5,10 +5,10 @@ import sqlite3
 from datetime import datetime, timezone
 import math
 
-st.set_page_config(page_title="NOX AUTO TRADER 3.4", page_icon="📈", layout="wide")
-st.title("📈 NOX AUTO TRADER 3.4")
-st.caption("Crypto-first automated PAPER trading · 1-minute monitoring · 500 SEK · 2% risk · No leverage")
-st.warning("PAPER TRADING ENDAST. Inga riktiga order eller pengar används. Första automatiska paper-versionen handlar endast krypto där pris- och valutaberäkningen kan kontrolleras. Aktier, forex och råvaror är fortsatt signalbevakning.")
+st.set_page_config(page_title="NOX AUTO TRADER 3.5", page_icon="📈", layout="wide")
+st.title("📈 NOX AUTO TRADER 3.5")
+st.caption("Balanced crypto scalping · 1m entries + 5m trend filter · 500 SEK · max 2% risk · No leverage")
+st.warning("PAPER TRADING ENDAST. Inga riktiga order eller pengar används. Balanced scalping med 1m-inträde och 5m-trendfilter. Strategin är experimentell och 40 % vinstaffärer är ett testmål, inte en garanti.")
 
 # Risk and execution assumptions
 START_CASH = 500.0
@@ -19,11 +19,14 @@ FEE_RATE = 0.001       # illustrative paper fee per side
 STOP_ATR = 1.5
 TARGET_R = 2.0
 SIGNAL_THRESHOLD = 80
+COOLDOWN_AFTER_STOP_MIN = 5
+MAX_EXTENSION_ATR = 0.8
+MAX_ATR_PCT = 0.012
 MIN_NOTIONAL_SEK = 20.0
 MAX_HOLD_MINUTES = 90
 
 DB = "nox_v33_paper.sqlite"  # Keep existing paper account and open positions
-HEADERS = {"User-Agent": "Mozilla/5.0 NOX-Auto-Trader/3.4"}
+HEADERS = {"User-Agent": "Mozilla/5.0 NOX-Auto-Trader/3.5"}
 OKX_URL = "https://www.okx.com/api/v5/market/candles"
 BYBIT_URL = "https://api.bybit.com/v5/market/kline"
 FX_URL = "https://open.er-api.com/v6/latest/USD"
@@ -74,7 +77,7 @@ def usd_sek_rate():
     return rate
 
 def get_okx(inst):
-    r = requests.get(OKX_URL, params={"instId":inst,"bar":"1m","limit":"100"},
+    r = requests.get(OKX_URL, params={"instId":inst,"bar":"1m","limit":"300"},
                      headers=HEADERS, timeout=8)
     r.raise_for_status()
     j = r.json()
@@ -91,7 +94,7 @@ def get_okx(inst):
     return closed.reset_index(drop=True), "OKX"
 
 def get_bybit(symbol):
-    r = requests.get(BYBIT_URL, params={"category":"spot","symbol":symbol,"interval":"1","limit":100},
+    r = requests.get(BYBIT_URL, params={"category":"spot","symbol":symbol,"interval":"1","limit":300},
                      headers=HEADERS, timeout=8)
     r.raise_for_status()
     j = r.json()
@@ -134,24 +137,68 @@ def get_yahoo(symbol):
     return d, "Yahoo Finance"
 
 def analyze(d):
-    c=d["close"]
-    e9=c.ewm(span=9,adjust=False).mean()
-    e21=c.ewm(span=21,adjust=False).mean()
-    delta=c.diff()
-    gain=delta.clip(lower=0).rolling(14).mean()
-    loss=-delta.clip(upper=0).rolling(14).mean()
-    rs=gain/loss.replace(0,float("nan"))
-    rsi=100-100/(1+rs)
-    tr=pd.concat([(d["high"]-d["low"]),(d["high"]-c.shift()).abs(),
-                  (d["low"]-c.shift()).abs()],axis=1).max(axis=1)
-    atr=tr.rolling(14).mean()
-    vol=d["volume"].fillna(0) if "volume" in d else pd.Series([0]*len(d))
-    score=0
-    if e9.iloc[-1] > e21.iloc[-1]: score += 40
-    if c.iloc[-1] > e9.iloc[-1]: score += 20
-    if pd.notna(rsi.iloc[-1]) and 50 <= rsi.iloc[-1] <= 68: score += 25
-    if vol.iloc[-1] >= vol.tail(20).median(): score += 15
-    return float(c.iloc[-1]), int(score), float(rsi.iloc[-1]) if pd.notna(rsi.iloc[-1]) else None, float(atr.iloc[-1]), str(d.iloc[-1]["ts"])
+    """Balanced setup: 1m entry momentum confirmed by a 5m trend filter."""
+    d = d.copy().sort_values("ts").reset_index(drop=True)
+    c = d["close"].astype(float)
+    e9 = c.ewm(span=9, adjust=False).mean()
+    e21 = c.ewm(span=21, adjust=False).mean()
+    delta = c.diff()
+    gain = delta.clip(lower=0).rolling(14).mean()
+    loss = -delta.clip(upper=0).rolling(14).mean()
+    rs = gain / loss.replace(0, float("nan"))
+    rsi_series = 100 - 100 / (1 + rs)
+    if loss.iloc[-1] == 0 and gain.iloc[-1] > 0:
+        rsi_value = 100.0
+    else:
+        rsi_value = float(rsi_series.iloc[-1]) if pd.notna(rsi_series.iloc[-1]) else None
+
+    tr = pd.concat([(d["high"]-d["low"]), (d["high"]-c.shift()).abs(),
+                    (d["low"]-c.shift()).abs()], axis=1).max(axis=1)
+    atr_series = tr.rolling(14).mean()
+    atr_value = float(atr_series.iloc[-1])
+    price = float(c.iloc[-1])
+
+    # Build closed 5-minute candles from the already-confirmed 1-minute candles.
+    ts_num = pd.to_numeric(d["ts"], errors="coerce")
+    if ts_num.notna().all() and float(ts_num.iloc[-1]) > 10**11:
+        idx = pd.to_datetime(ts_num, unit="ms", utc=True)
+    else:
+        idx = pd.to_datetime(ts_num, unit="s", utc=True)
+    five = d.set_index(idx).resample("5min", label="right", closed="right").agg(
+        {"open":"first", "high":"max", "low":"min", "close":"last", "volume":"sum"}
+    ).dropna(subset=["close"])
+    # Last resampled bucket can be partial depending on provider timestamping; use
+    # only buckets whose right edge is no later than the last completed 1m candle.
+    if len(five) < 15:
+        raise ValueError("För få 5m-staplar för trendfilter")
+    c5 = five["close"].astype(float)
+    ema5_fast = c5.ewm(span=9, adjust=False).mean()
+    ema5_slow = c5.ewm(span=21, adjust=False).mean()
+    htf_up = bool(ema5_fast.iloc[-1] > ema5_slow.iloc[-1] and c5.iloc[-1] > ema5_fast.iloc[-1]
+                  and ema5_fast.iloc[-1] >= ema5_fast.iloc[-2])
+
+    vol = pd.to_numeric(d["volume"], errors="coerce").fillna(0)
+    vol_base = float(vol.iloc[-21:-1].median()) if len(vol) >= 22 else 0.0
+    vol_ratio = float(vol.iloc[-1] / vol_base) if vol_base > 0 else 0.0
+    momentum = float((c.iloc[-1] / c.iloc[-4] - 1) * 100) if len(c) >= 4 and c.iloc[-4] else 0.0
+    extension_atr = (price - float(e9.iloc[-1])) / atr_value if atr_value > 0 else 999.0
+    atr_pct = atr_value / price if price > 0 else 999.0
+
+    score = 0
+    if e9.iloc[-1] > e21.iloc[-1]: score += 25
+    if price > e9.iloc[-1]: score += 15
+    if htf_up: score += 30
+    if rsi_value is not None and 50 <= rsi_value <= 67: score += 15
+    if momentum > 0: score += 5
+    if vol_ratio >= 1.10: score += 10
+
+    # Hard safety gates: no counter-trend trades, no overheated entries, no extreme volatility.
+    eligible = (htf_up and price > e9.iloc[-1] and rsi_value is not None
+                and 50 <= rsi_value <= 67 and extension_atr <= MAX_EXTENSION_ATR
+                and atr_pct <= MAX_ATR_PCT and momentum > 0)
+    if not eligible:
+        score = min(score, 79)
+    return price, int(score), rsi_value, atr_value, str(d.iloc[-1]["ts"])
 
 def account():
     return conn.execute("SELECT cash,realized FROM account WHERE id=1").fetchone()
@@ -166,6 +213,14 @@ def open_position(symbol, price, atr, fx, score, candle):
         return "Redan handlad denna minut"
     if conn.execute("SELECT COUNT(*) FROM positions WHERE symbol=? AND entry_candle=?",(symbol,candle)).fetchone()[0]:
         return "Redan öppnad på denna stapel"
+    last = conn.execute("SELECT reason,closed_utc FROM trades WHERE symbol=? ORDER BY id DESC LIMIT 1",(symbol,)).fetchone()
+    if last and last[0] == "Stop-loss":
+        try:
+            last_closed = datetime.fromisoformat(last[1])
+            if (datetime.now(timezone.utc) - last_closed).total_seconds() < COOLDOWN_AFTER_STOP_MIN * 60:
+                return "Paus efter stop-loss (5 min)"
+        except Exception:
+            pass
 
     cash, realized = account()
     # Conservative account equity estimate: cash plus entry value of open positions.
@@ -236,15 +291,26 @@ def manage_positions(fx):
         symbol=p[1]
         try:
             d,provider=get_crypto(symbol.replace("USDT","-USDT"),symbol)
-            price=float(d.close.iloc[-1])
+            last_bar=d.iloc[-1]
+            price=float(last_bar["close"])
+            bar_open=float(last_bar["open"])
+            bar_low=float(last_bar["low"])
+            bar_high=float(last_bar["high"])
             opened=datetime.fromisoformat(p[12])
             age=(datetime.now(timezone.utc)-opened).total_seconds()/60
             reason=None
-            if price <= p[4]: reason="Stop-loss"
-            elif price >= p[5]: reason="Take-profit"
-            elif age >= MAX_HOLD_MINUTES: reason="Tidsgräns 90 min"
+            exit_price=price
+            # Conservative rule if both stop and target are touched in one candle: stop wins.
+            if bar_low <= p[4]:
+                reason="Stop-loss"
+                exit_price=min(bar_open, p[4])
+            elif bar_high >= p[5]:
+                reason="Take-profit"
+                exit_price=max(bar_open, p[5])
+            elif age >= MAX_HOLD_MINUTES:
+                reason="Tidsgräns 90 min"
             if reason:
-                close_position(p,price,fx,reason)
+                close_position(p,exit_price,fx,reason)
                 events.append(f"Stängde {symbol}: {reason}")
         except Exception as e:
             events.append(f"Kunde inte uppdatera {symbol}: {str(e)[:70]}")
@@ -285,7 +351,7 @@ with st.sidebar:
     st.metric("Max öppna positioner", MAX_OPEN)
     st.metric("Simulerad avgift", "0,10 % per sida")
     auto=st.toggle("Automatisk paper trading varje minut", value=True)
-    st.caption("Krypto spot LONG-only. Ingen hävstång. Högst 25 % av kapitalet i en position. Maximal planerad sammanlagd risk kan bli 8 % när fyra positioner är öppna.")
+    st.caption("Krypto spot LONG-only. Ingen hävstång. Högst 25 % av kapitalet i en position. Maxrisk 2 % per affär; fyra positioner kan tillsammans riskera upp till 8 %. Efter stop-loss pausas samma symbol i 5 minuter.")
     st.caption("Appen måste vara aktiv. Streamlit Cloud garanterar inte 24/7-drift.")
 
 def render_live_summary(fx=None, rows=None):
@@ -312,7 +378,7 @@ def render_live_summary(fx=None, rows=None):
     c4.metric("Realiserat resultat",f"{realized:+.2f} kr")
     c5.metric("Öppen planerad risk",f"{total_open_risk:.2f} kr")
 
-st.info("Automatisk paper trading är aktiverad som standard. Nya köp kräver signal ≥80/100, bekräftad stängd 1m-stapel, max 2 % riskbudget per affär och tillgängligt kapital. Högst fyra positioner. Endast krypto öppnar positioner.")
+st.info("Balanced filter: 1m EMA-trend + bekräftad 5m-trend, RSI 50–67, positivt momentum, volymkontroll och skydd mot översträckta/volatila inträden. Köp kräver signal ≥80/100. Stop/target kontrolleras mot candle high/low; om båda träffas i samma stapel räknas stop-loss först.")
 if "last_rows" not in st.session_state: st.session_state.last_rows=[]
 if "last_events" not in st.session_state: st.session_state.last_events=[]
 if "last_cycle" not in st.session_state: st.session_state.last_cycle="Ingen cykel ännu"
@@ -342,8 +408,29 @@ if auto:
         else: st.dataframe(current,use_container_width=True,hide_index=True)
         history=pd.read_sql_query("SELECT symbol,entry_sek,exit_sek,pnl_sek,fees_sek,reason,closed_utc FROM trades ORDER BY id DESC LIMIT 30",conn)
         st.subheader("Senaste stängda paper-affärer")
-        if history.empty: st.write("Ingen stängd affär ännu.")
-        else: st.dataframe(history,use_container_width=True,hide_index=True)
+        if history.empty:
+            st.write("Ingen stängd affär ännu.")
+        else:
+            st.dataframe(history,use_container_width=True,hide_index=True)
+        all_trades=pd.read_sql_query("SELECT pnl_sek,fees_sek,reason FROM trades",conn)
+        st.subheader("Strategistatistik")
+        if all_trades.empty:
+            st.write("Statistik visas när affärer har stängts.")
+        else:
+            wins=all_trades[all_trades.pnl_sek > 0]
+            losses=all_trades[all_trades.pnl_sek < 0]
+            win_rate=100*len(wins)/len(all_trades)
+            avg_win=float(wins.pnl_sek.mean()) if len(wins) else 0.0
+            avg_loss=abs(float(losses.pnl_sek.mean())) if len(losses) else 0.0
+            gross_profit=float(wins.pnl_sek.sum()) if len(wins) else 0.0
+            gross_loss=abs(float(losses.pnl_sek.sum())) if len(losses) else 0.0
+            pf=(gross_profit/gross_loss) if gross_loss > 0 else None
+            m1,m2,m3,m4=st.columns(4)
+            m1.metric("Vinstprocent",f"{win_rate:.1f}%",help="Andel stängda affärer med positivt resultat efter avgifter.")
+            m2.metric("Snittvinst",f"{avg_win:.3f} kr")
+            m3.metric("Snittförlust",f"-{avg_loss:.3f} kr")
+            m4.metric("Profit factor",f"{pf:.2f}" if pf is not None else "—")
+            st.caption(f"Baserat på {len(all_trades)} stängda affärer. Målet ≥40 % är ett testmål; utvärdera först efter minst 100 affärer och kontrollera även totalresultat efter avgifter.")
     live_engine()
 else:
     if st.button("▶ Kör en paper trading-cykel",type="primary"):
@@ -358,4 +445,4 @@ else:
 st.subheader("Övriga marknader – endast signalbevakning")
 st.write("Aktier, forex och råvaror är ännu inte kopplade till automatisk paper-exekvering. Vi aktiverar dem först när valutakonvertering, kontraktsstorlekar och handelsvillkor har verifierats.")
 
-st.caption("VIKTIGT: 2 % risk per affär innebär 10 kr planerad risk vid 500 kr eget kapital. Fyra samtidiga positioner kan innebära upp till 40 kr (8 %) sammanlagd planerad risk. SQLite-filen ligger på Streamlit-appens filsystem och kan försvinna vid omstart/omdeploy. Detta är en testmiljö, inte en beständig handelsjournal. Avgift 0,10 % per sida är ett förenklat antagande; spread/slippage modelleras inte. Testa under uppsikt innan du drar slutsatser.")
+st.caption("VIKTIGT: 2 % är ett max per affär (10 kr vid 500 kr eget kapital); positionsstorleksgränsen på 25 % kan göra faktisk risk lägre. Fyra samtidiga positioner kan innebära upp till 40 kr (8 %) sammanlagd planerad risk. SQLite-filen ligger på Streamlit-appens filsystem och kan försvinna vid omstart/omdeploy. Detta är en testmiljö, inte en beständig handelsjournal. Avgift 0,10 % per sida är ett förenklat antagande; spread/slippage och orderboksdjup modelleras inte. Inträden använder 1m-staplar men 5m-trendfilter; stop/target använder high/low med konservativ stop-prioritet. Testa under uppsikt innan du drar slutsatser.")
