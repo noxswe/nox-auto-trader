@@ -5,28 +5,31 @@ import sqlite3
 from datetime import datetime, timezone
 import math
 
-st.set_page_config(page_title="NOX AUTO TRADER 3.6", page_icon="📈", layout="wide")
-st.title("📈 NOX AUTO TRADER 3.6")
-st.caption("Balanced crypto scalping · 15 spot pairs · 1m entries + 5m trend filter · 500 SEK · max 2% risk")
-st.warning("PAPER TRADING ENDAST. Inga riktiga order eller pengar används. Balanced scalping med 1m-inträde och 5m-trendfilter. Strategin är experimentell och 40 % vinstaffärer är ett testmål, inte en garanti.")
+st.set_page_config(page_title="NOX AUTO TRADER 3.7", page_icon="📈", layout="wide")
+st.title("📈 NOX AUTO TRADER 3.7")
+st.caption("Selective crypto scalping · 15 spot pairs · pullback confirmation · net-cost filter · 500 SEK · max 2% risk")
+st.warning("PAPER TRADING ENDAST. Inga riktiga order eller pengar används. Selektiv scalping med 1m-rekylbekräftelse och 5m-trendfilter. Nettomål kontrolleras mot avgifter och uppskattad slippage. Ingen lönsamhet är garanterad.")
 
 # Risk and execution assumptions
 START_CASH = 500.0
 RISK_FRACTION = 0.02
-MAX_OPEN = 4
-MAX_NOTIONAL_FRACTION = 0.25
+MAX_OPEN = 2
+MAX_NOTIONAL_FRACTION = 0.45
 FEE_RATE = 0.001       # illustrative paper fee per side
 STOP_ATR = 1.5
 TARGET_R = 2.0
+ESTIMATED_SLIPPAGE_PER_SIDE = 0.00025  # 0.025% per side; 0.05% round trip
+ESTIMATED_SLIPPAGE_ROUNDTRIP = 2 * ESTIMATED_SLIPPAGE_PER_SIDE
+MIN_NET_REWARD_R = 1.10
 SIGNAL_THRESHOLD = 80
 COOLDOWN_AFTER_STOP_MIN = 5
 MAX_EXTENSION_ATR = 0.8
 MAX_ATR_PCT = 0.012
-MIN_NOTIONAL_SEK = 20.0
+MIN_NOTIONAL_SEK = 40.0
 MAX_HOLD_MINUTES = 90
 
-DB = "nox_v35_paper_fresh.sqlite"  # Fresh 3.5 paper account; old 3.3/3.4 history is not loaded
-HEADERS = {"User-Agent": "Mozilla/5.0 NOX-Auto-Trader/3.6"}
+DB = "nox_v37_paper.sqlite"  # Fresh 3.7 paper account; prior paper history is kept separate
+HEADERS = {"User-Agent": "Mozilla/5.0 NOX-Auto-Trader/3.7"}
 OKX_URL = "https://www.okx.com/api/v5/market/candles"
 BYBIT_URL = "https://api.bybit.com/v5/market/kline"
 FX_URL = "https://open.er-api.com/v6/latest/USD"
@@ -191,6 +194,12 @@ def analyze(d):
     momentum = float((c.iloc[-1] / c.iloc[-4] - 1) * 100) if len(c) >= 4 and c.iloc[-4] else 0.0
     extension_atr = (price - float(e9.iloc[-1])) / atr_value if atr_value > 0 else 999.0
     atr_pct = atr_value / price if price > 0 else 999.0
+    # Entry must show a recent pullback toward EMA9 followed by a close above
+    # the previous candle high: avoid buying merely because price is already rising.
+    prev_low = float(d["low"].iloc[-2])
+    prev_high = float(d["high"].iloc[-2])
+    prev_ema9 = float(e9.iloc[-2])
+    pullback_reclaim = bool(prev_low <= prev_ema9 + 0.15 * atr_value and price > prev_high)
 
     score = 0
     if e9.iloc[-1] > e21.iloc[-1]: score += 25
@@ -199,9 +208,10 @@ def analyze(d):
     if rsi_value is not None and 50 <= rsi_value <= 67: score += 15
     if momentum > 0: score += 5
     if vol_ratio >= 1.10: score += 10
+    if pullback_reclaim: score += 10
 
-    # Hard safety gates: no counter-trend trades, no overheated entries, no extreme volatility.
-    eligible = (htf_up and price > e9.iloc[-1] and rsi_value is not None
+    # Hard safety gates: trend, pullback/reclaim, no overheated or extreme-volatility entries.
+    eligible = (htf_up and pullback_reclaim and price > e9.iloc[-1] and rsi_value is not None
                 and 50 <= rsi_value <= 67 and extension_atr <= MAX_EXTENSION_ATR
                 and atr_pct <= MAX_ATR_PCT and momentum > 0)
     if not eligible:
@@ -236,20 +246,31 @@ def open_position(symbol, price, atr, fx, score, candle):
     equity = cash + open_cost
     risk_budget = equity * RISK_FRACTION
     stop_distance = max(1.5 * atr, price * 0.002)
+    target_distance = TARGET_R * stop_distance
+    # Include both trading fees and a conservative slippage allowance in the entry test.
+    roundtrip_cost_pct = (2 * FEE_RATE) + ESTIMATED_SLIPPAGE_ROUNDTRIP
+    net_reward_per_unit = (target_distance - price * roundtrip_cost_pct) * fx
+    net_risk_per_unit = (stop_distance + price * roundtrip_cost_pct) * fx
+    if net_reward_per_unit <= 0 or net_risk_per_unit <= 0:
+        return "Avstår: målet täcker inte uppskattade handelskostnader"
+    net_reward_r = net_reward_per_unit / net_risk_per_unit
+    if net_reward_r < MIN_NET_REWARD_R:
+        return f"Avstår: netto-R/R {net_reward_r:.2f} under {MIN_NET_REWARD_R:.2f}"
     stop = price - stop_distance
-    target = price + 2.0 * stop_distance
+    target = price + target_distance
     entry_sek = price * fx
     stop_sek = stop * fx
     target_sek = target * fx
-    risk_per_unit_sek = stop_distance * fx
+    # Risk budget includes estimated round-trip costs; no leverage and cash remain binding.
+    risk_per_unit_sek = net_risk_per_unit
     qty_by_risk = risk_budget / risk_per_unit_sek
     max_notional = min(cash * MAX_NOTIONAL_FRACTION, equity * MAX_NOTIONAL_FRACTION)
     qty_by_cash = max_notional / entry_sek
     qty = min(qty_by_risk, qty_by_cash)
     notional_sek = qty * entry_sek
-    entry_fee = notional_sek * FEE_RATE
+    entry_fee = notional_sek * (FEE_RATE + ESTIMATED_SLIPPAGE_PER_SIDE)
     if notional_sek < MIN_NOTIONAL_SEK:
-        return "Position för liten efter riskbegränsning"
+        return "Position för liten efter risk- och kapitalbegränsning"
     if notional_sek + entry_fee > cash:
         return "Otillräckliga kontanter"
     actual_risk = qty * risk_per_unit_sek
@@ -277,7 +298,7 @@ def close_position(pos, price, fx, reason):
     (pid,symbol,qty,entry,stop,target,entry_sek,stop_sek,target_sek,risk,notional,entry_fee,opened,candle)=pos
     exit_sek=price*fx
     exit_value=qty*exit_sek
-    exit_fee=exit_value*FEE_RATE
+    exit_fee=exit_value*(FEE_RATE + ESTIMATED_SLIPPAGE_PER_SIDE)
     gross=(exit_sek-entry_sek)*qty
     pnl=gross-entry_fee-exit_fee
     cash,realized=account()
@@ -357,9 +378,10 @@ with st.sidebar:
     st.metric("Startkapital", "500 kr")
     st.metric("Risk per affär", "2 % av aktuellt eget kapital")
     st.metric("Max öppna positioner", MAX_OPEN)
-    st.metric("Simulerad avgift", "0,10 % per sida")
+    st.metric("Max kapital per position", "45 %")
+    st.metric("Handelskostnad", "0,125 % per sida")
     auto=st.toggle("Automatisk paper trading varje minut", value=True)
-    st.caption("Krypto spot LONG-only. Ingen hävstång. Högst 25 % av kapitalet i en position. Maxrisk 2 % per affär; fyra positioner kan tillsammans riskera upp till 8 %. Efter stop-loss pausas samma symbol i 5 minuter.")
+    st.caption("Krypto spot LONG-only. Ingen hävstång. Högst 45 % av kapitalet i en position och max två samtidiga positioner. 2 % är planerad maxrisk per affär inklusive uppskattade avgifter/slippage; kapitaltaket kan göra faktisk risk lägre. Efter stop-loss pausas samma symbol i 5 minuter.")
     st.caption("Appen måste vara aktiv. Streamlit Cloud garanterar inte 24/7-drift.")
 
 def render_live_summary(fx=None, rows=None):
@@ -386,7 +408,7 @@ def render_live_summary(fx=None, rows=None):
     c4.metric("Realiserat resultat",f"{realized:+.2f} kr")
     c5.metric("Öppen planerad risk",f"{total_open_risk:.2f} kr")
 
-st.info("Balanced filter: 1m EMA-trend + bekräftad 5m-trend, RSI 50–67, positivt momentum, volymkontroll och skydd mot översträckta/volatila inträden. Köp kräver signal ≥80/100. Stop/target kontrolleras mot candle high/low; om båda träffas i samma stapel räknas stop-loss först.")
+st.info("NOX 3.7: 1m pullback/reclaim krävs (föregående rekyl mot EMA9 och stängning över föregående stapels high), tillsammans med 5m upptrend, RSI 50–67, positivt momentum och skydd mot översträckta/volatila inträden. Köp kräver signal ≥80/100 samt uppskattad netto-R/R ≥1,10 efter 0,10 % avgift per sida och 0,05 % uppskattad round-trip slippage. Stop/target kontrolleras mot candle high/low; om båda träffas i samma stapel räknas stop-loss först.")
 if "last_rows" not in st.session_state: st.session_state.last_rows=[]
 if "last_events" not in st.session_state: st.session_state.last_events=[]
 if "last_cycle" not in st.session_state: st.session_state.last_cycle="Ingen cykel ännu"
@@ -438,7 +460,7 @@ if auto:
             m2.metric("Snittvinst",f"{avg_win:.3f} kr")
             m3.metric("Snittförlust",f"-{avg_loss:.3f} kr")
             m4.metric("Profit factor",f"{pf:.2f}" if pf is not None else "—")
-            st.caption(f"Baserat på {len(all_trades)} stängda affärer. Målet ≥40 % är ett testmål; utvärdera först efter minst 100 affärer och kontrollera även totalresultat efter avgifter.")
+            st.caption(f"Baserat på {len(all_trades)} stängda affärer. Utvärdera nettoresultat och profit factor efter minst 100 affärer; positiv förväntan är inte garanterad.")
     live_engine()
 else:
     if st.button("▶ Kör en paper trading-cykel",type="primary"):
@@ -453,4 +475,4 @@ else:
 st.subheader("Övriga marknader – endast signalbevakning")
 st.write("Aktier, forex och råvaror är ännu inte kopplade till automatisk paper-exekvering. Vi aktiverar dem först när valutakonvertering, kontraktsstorlekar och handelsvillkor har verifierats.")
 
-st.caption("VIKTIGT: 2 % är ett max per affär (10 kr vid 500 kr eget kapital); positionsstorleksgränsen på 25 % kan göra faktisk risk lägre. Fyra samtidiga positioner kan innebära upp till 40 kr (8 %) sammanlagd planerad risk. SQLite-filen ligger på Streamlit-appens filsystem och kan försvinna vid omstart/omdeploy. Detta är en testmiljö, inte en beständig handelsjournal. Avgift 0,10 % per sida är ett förenklat antagande; spread/slippage och orderboksdjup modelleras inte. Inträden använder 1m-staplar men 5m-trendfilter; stop/target använder high/low med konservativ stop-prioritet. Testa under uppsikt innan du drar slutsatser.")
+st.caption("VIKTIGT: 2 % motsvarar 10 kr planerad maxrisk vid 500 kr eget kapital, inklusive uppskattad round-trip-kostnad. Utan hävstång och med max 45 % kapital per position kan faktisk risk bli lägre än 10 kr. Två samtidiga positioner kan tillsammans ha upp till 20 kr planerad risk. Avgift 0,10 % per sida och uppskattad slippage 0,025 % per sida är antaganden, inte garanterade verkliga kostnader; spread och orderboksdjup mäts inte. SQLite-filen kan försvinna vid omstart/omdeploy. Detta är en testmiljö, inte en beständig handelsjournal. Testa under uppsikt och dra inga lönsamhetsslutsatser från få affärer.")
