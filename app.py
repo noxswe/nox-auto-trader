@@ -1,46 +1,73 @@
 import streamlit as st
 import pandas as pd
 import requests
-import sqlite3
 from datetime import datetime, timezone
+import time
 
-st.set_page_config(page_title="NOX AUTO TRADER 3.0", page_icon="📈", layout="wide")
-st.title("📈 NOX AUTO TRADER 3.0")
-st.caption("Balanced scalping · Paper trading · 500 SEK · No leverage")
-st.warning("SIMULERING ENDAST. Ingen riktig handel. Detta är en experimentell prototyp, inte en bevisat lönsam strategi. Gratis Streamlit garanterar inte kontinuerlig bakgrundsdrift.")
+st.set_page_config(page_title="NOX AUTO TRADER 3.2", page_icon="📈", layout="wide")
+st.title("📈 NOX AUTO TRADER 3.2")
+st.caption("Crypto-first balanced scalping · Live refresh each minute · Paper scanner only · 500 SEK · No leverage")
+st.warning("SIMULERING ENDAST. Inga riktiga order. Prototypen visar signaler men öppnar inte affärer. Streamlit Cloud kan sova eller begränsa bakgrundskörning; minutuppdatering gäller bara medan app-sessionen är aktiv.")
 
-DB="nox_v3_paper.db"
-conn=sqlite3.connect(DB, check_same_thread=False)
-conn.execute("CREATE TABLE IF NOT EXISTS account (id INTEGER PRIMARY KEY CHECK(id=1), cash REAL, realized REAL)")
-conn.execute("CREATE TABLE IF NOT EXISTS trades (id INTEGER PRIMARY KEY AUTOINCREMENT, symbol TEXT, market TEXT, entry REAL, exit REAL, qty REAL, pnl_sek REAL, status TEXT, opened TEXT, closed TEXT, reason TEXT)")
-if conn.execute("SELECT COUNT(*) FROM account").fetchone()[0]==0:
-    conn.execute("INSERT INTO account VALUES (1,500,0)")
-conn.commit()
+HEADERS = {"User-Agent": "Mozilla/5.0 NOX-Auto-Trader/3.2"}
+OKX_URL = "https://www.okx.com/api/v5/market/candles"
+BYBIT_URL = "https://api.bybit.com/v5/market/kline"
+YAHOO_URL = "https://query1.finance.yahoo.com/v8/finance/chart/"
 
-BINANCE="https://api.binance.com/api/v3/klines"
-YAHOO="https://query1.finance.yahoo.com/v8/finance/chart/"
-ASSETS=[
-("BTCUSDT","Krypto","binance"),("ETHUSDT","Krypto","binance"),("SOLUSDT","Krypto","binance"),("BNBUSDT","Krypto","binance"),("XRPUSDT","Krypto","binance"),
-("AAPL","Aktie","yahoo"),("MSFT","Aktie","yahoo"),("NVDA","Aktie","yahoo"),("AMZN","Aktie","yahoo"),("GOOGL","Aktie","yahoo"),("META","Aktie","yahoo"),("TSLA","Aktie","yahoo"),("JPM","Aktie","yahoo"),("AVGO","Aktie","yahoo"),("LLY","Aktie","yahoo"),
-("EURUSD=X","Forex","yahoo"),("GBPUSD=X","Forex","yahoo"),("USDJPY=X","Forex","yahoo"),
-("GC=F","Råvara","yahoo"),("SI=F","Råvara","yahoo"),("CL=F","Råvara","yahoo")]
+CRYPTO = [
+    ("BTC-USDT","BTCUSDT"), ("ETH-USDT","ETHUSDT"),
+    ("SOL-USDT","SOLUSDT"), ("BNB-USDT","BNBUSDT"),
+    ("XRP-USDT","XRPUSDT")
+]
+OTHER = [
+    ("AAPL","Aktie"),("MSFT","Aktie"),("NVDA","Aktie"),("AMZN","Aktie"),
+    ("GOOGL","Aktie"),("META","Aktie"),("TSLA","Aktie"),("JPM","Aktie"),
+    ("AVGO","Aktie"),("LLY","Aktie"),
+    ("EURUSD=X","Forex"),("GBPUSD=X","Forex"),("USDJPY=X","Forex"),
+    ("GC=F","Råvara"),("SI=F","Råvara"),("CL=F","Råvara")
+]
 
-def get_data(symbol, source):
-    if source=="binance":
-        r=requests.get(BINANCE,params={"symbol":symbol,"interval":"1m","limit":100},timeout=12)
-        r.raise_for_status()
-        d=pd.DataFrame(r.json(),columns=["t","o","h","l","c","v","ct","q","n","tb","tq","ig"])
-        d["close"]=pd.to_numeric(d["c"],errors="coerce")
-        d["volume"]=pd.to_numeric(d["v"],errors="coerce")
-        return d.dropna(subset=["close"])
-    r=requests.get(YAHOO+requests.utils.quote(symbol,safe=""),params={"range":"1d","interval":"1m"},headers={"User-Agent":"Mozilla/5.0"},timeout=12)
+def get_okx(inst):
+    r=requests.get(OKX_URL,params={"instId":inst,"bar":"1m","limit":"100"},headers=HEADERS,timeout=8)
     r.raise_for_status()
-    result=r.json()["chart"]["result"]
-    if not result: raise ValueError("Ingen intradagsdata")
-    q=result[0]["indicators"]["quote"][0]
-    d=pd.DataFrame({"close":q.get("close"),"volume":q.get("volume")}).dropna(subset=["close"])
+    j=r.json()
+    if j.get("code")!="0" or not j.get("data"):
+        raise ValueError("OKX: "+str(j.get("msg","ingen data")))
+    d=pd.DataFrame(j["data"],columns=["ts","open","high","low","close","volume","vol_ccy","vol_quote","confirm"])
+    for c in ["open","high","low","close","volume"]: d[c]=pd.to_numeric(d[c],errors="coerce")
+    return d.sort_values("ts").dropna(subset=["close"]).reset_index(drop=True),"OKX"
+
+def get_bybit(symbol):
+    r=requests.get(BYBIT_URL,params={"category":"spot","symbol":symbol,"interval":"1","limit":100},headers=HEADERS,timeout=8)
+    r.raise_for_status()
+    j=r.json()
+    if j.get("retCode")!=0 or not j.get("result",{}).get("list"):
+        raise ValueError("Bybit: "+str(j.get("retMsg","ingen data")))
+    d=pd.DataFrame(j["result"]["list"],columns=["ts","open","high","low","close","volume","turnover"])
+    for c in ["open","high","low","close","volume"]: d[c]=pd.to_numeric(d[c],errors="coerce")
+    return d.sort_values("ts").dropna(subset=["close"]).reset_index(drop=True),"Bybit"
+
+def get_crypto(inst,symbol):
+    errors=[]
+    for fn in (lambda:get_okx(inst),lambda:get_bybit(symbol)):
+        try: return fn()
+        except Exception as e: errors.append(str(e)[:80])
+    raise RuntimeError("OKX och Bybit misslyckades: "+" | ".join(errors))
+
+def get_yahoo(symbol):
+    r=requests.get(YAHOO_URL+requests.utils.quote(symbol,safe=""),
+        params={"range":"1d","interval":"1m"},headers=HEADERS,timeout=8)
+    r.raise_for_status()
+    chart=r.json().get("chart",{})
+    if chart.get("error") or not chart.get("result"): raise ValueError("Yahoo saknar intradagsdata")
+    result=chart["result"][0]
+    q=result["indicators"]["quote"][0]
+    ts=result.get("timestamp") or []
+    d=pd.DataFrame({k:q.get(k) for k in ["open","high","low","close","volume"]})
+    d["ts"]=ts[:len(d)] if ts else list(range(len(d)))
+    d=d.dropna(subset=["close"]).reset_index(drop=True)
     if len(d)<35: raise ValueError("För få 1-minutsstaplar")
-    return d
+    return d,"Yahoo Finance"
 
 def signal(d):
     c=d.close
@@ -50,48 +77,95 @@ def signal(d):
     gain=delta.clip(lower=0).rolling(14).mean()
     loss=-delta.clip(upper=0).rolling(14).mean()
     rsi=100-100/(1+gain/loss.replace(0,float("nan")))
-    vol=d.volume.fillna(0)
+    vol=d.volume.fillna(0) if "volume" in d else pd.Series([0]*len(d))
     score=0
     if e9.iloc[-1]>e21.iloc[-1]: score+=40
     if c.iloc[-1]>e9.iloc[-1]: score+=20
-    if 50<=rsi.iloc[-1]<=68: score+=25
+    if pd.notna(rsi.iloc[-1]) and 50<=rsi.iloc[-1]<=68: score+=25
     if vol.iloc[-1]>=vol.tail(20).median(): score+=15
-    return float(c.iloc[-1]),int(score),float(rsi.iloc[-1])
+    candle=str(d.ts.iloc[-1]) if "ts" in d else "unknown"
+    return float(c.iloc[-1]),int(score),float(rsi.iloc[-1]) if pd.notna(rsi.iloc[-1]) else None,candle
 
-cash,realized=conn.execute("SELECT cash,realized FROM account WHERE id=1").fetchone()
-trades=pd.read_sql_query("SELECT * FROM trades WHERE status='OPEN'",conn)
-a,b,c,d=st.columns(4)
-a.metric("Kontanter",f"{cash:.2f} kr")
-b.metric("Realiserat resultat",f"{realized:+.2f} kr")
-c.metric("Öppna positioner",len(trades))
-d.metric("Riskbudget", "5,00 kr / affär")
-st.info("Scalpingprofil: 1-minutsdata, EMA 9/21, RSI 14 och volymfilter. Balanserad signalgräns: 80/100. Appen skannar endast när du trycker på knappen; den är inte en 24/7-bakgrundsbot.")
-
-if st.button("🔎 Skanna alla marknader nu",type="primary"):
-    results=[]
-    bar=st.progress(0)
-    for i,(symbol,market,source) in enumerate(ASSETS):
+def scan_crypto():
+    rows=[]
+    for inst,symbol in CRYPTO:
         try:
-            data=get_data(symbol,source)
-            price,score,rsi=signal(data)
-            status="Signal" if score>=80 else "Avvakta"
-            results.append({"Instrument":symbol,"Marknad":market,"Senaste pris":price,"Signal":score,"RSI":round(rsi,1),"Bedömning":status,"Datastatus":"OK"})
+            d,provider=get_crypto(inst,symbol)
+            price,score,rsi,candle=signal(d)
+            rows.append({"Instrument":symbol,"Marknad":"Krypto","Datakälla":provider,
+                "Senaste pris":price,"Signal":score,"RSI":round(rsi,1) if rsi is not None else None,
+                "Bedömning":"Stark signal" if score>=80 else "Avvakta","Senaste 1m-stapel":candle,"Datastatus":"OK"})
         except Exception as e:
-            results.append({"Instrument":symbol,"Marknad":market,"Senaste pris":None,"Signal":None,"RSI":None,"Bedömning":"—","Datastatus":str(e)[:65]})
-        bar.progress((i+1)/len(ASSETS))
-    st.session_state["scan"]=pd.DataFrame(results)
-    st.session_state["scan_time"]=datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            rows.append({"Instrument":symbol,"Marknad":"Krypto","Datakälla":"—","Senaste pris":None,
+                "Signal":None,"RSI":None,"Bedömning":"—","Senaste 1m-stapel":"—","Datastatus":str(e)[:120]})
+    return rows
 
-if "scan" in st.session_state:
-    st.caption("Senaste skanning: "+st.session_state["scan_time"])
-    st.dataframe(st.session_state["scan"],use_container_width=True,hide_index=True)
+def scan_other():
+    rows=[]
+    for symbol,market in OTHER:
+        try:
+            d,provider=get_yahoo(symbol)
+            price,score,rsi,candle=signal(d)
+            rows.append({"Instrument":symbol,"Marknad":market,"Datakälla":provider,
+                "Senaste pris":price,"Signal":score,"RSI":round(rsi,1) if rsi is not None else None,
+                "Bedömning":"Stark signal" if score>=80 else "Avvakta","Senaste 1m-stapel":candle,"Datastatus":"OK"})
+        except Exception as e:
+            rows.append({"Instrument":symbol,"Marknad":market,"Datakälla":"—","Senaste pris":None,
+                "Signal":None,"RSI":None,"Bedömning":"—","Senaste 1m-stapel":"—","Datastatus":str(e)[:120]})
+    return rows
+
+if "scan_data" not in st.session_state: st.session_state.scan_data=[]
+if "last_crypto_minute" not in st.session_state: st.session_state.last_crypto_minute=""
+if "last_other_minute" not in st.session_state: st.session_state.last_other_minute=""
+if "last_scan_display" not in st.session_state: st.session_state.last_scan_display="Ingen skanning ännu"
+
+with st.sidebar:
+    st.header("Inställningar")
+    st.metric("Simulerat startkapital","500 kr")
+    st.metric("Riskbudget (mål)","5 kr per affär")
+    st.caption("Ingen hävstång · Inga riktiga order")
+    auto=st.toggle("Automatisk uppdatering varje minut",value=True)
+    st.caption("Krypto skannas varje minut. Aktier, forex och råvaror skannas var femte minut.")
+    st.caption("Uppdatering fungerar medan app-sessionen är aktiv. Molnet kan försätta appen i viloläge.")
+
+def render_scan():
+    now=datetime.now(timezone.utc)
+    minute=now.strftime("%Y-%m-%d %H:%M")
+    do_crypto=(st.session_state.last_crypto_minute!=minute)
+    # Non-crypto markets are refreshed every fifth minute to limit provider requests.
+    do_other=(now.minute%5==0 and st.session_state.last_other_minute!=minute)
+    if do_crypto:
+        st.session_state.scan_data=[r for r in st.session_state.scan_data if r.get("Marknad")!="Krypto"]+scan_crypto()
+        st.session_state.last_crypto_minute=minute
+    if do_other:
+        st.session_state.scan_data=[r for r in st.session_state.scan_data if r.get("Marknad")=="Krypto"]+scan_other()
+        st.session_state.last_other_minute=minute
+    st.session_state.last_scan_display=now.strftime("%Y-%m-%d %H:%M:%S UTC")
+    df=pd.DataFrame(st.session_state.scan_data)
+    if not df.empty:
+        st.subheader("Krypto – huvudmarknad (uppdateras varje minut)")
+        st.dataframe(df[df["Marknad"]=="Krypto"],use_container_width=True,hide_index=True)
+        st.subheader("Övriga marknader (uppdateras var femte minut)")
+        st.dataframe(df[df["Marknad"]!="Krypto"],use_container_width=True,hide_index=True)
+        ok=int(((df["Marknad"]=="Krypto")&(df["Datastatus"]=="OK")).sum())
+        st.metric("Kryptoinstrument med fungerande data",f"{ok}/5")
+    st.caption("Senaste uppdateringscykel: "+st.session_state.last_scan_display)
+
+st.info("Marknadsprioritet: Krypto → Aktier → Forex → Råvaror. Varje ny minut analyseras bara den senaste tillgängliga 1-minutsstapeln. Denna version visar signaler men öppnar inga paper trades automatiskt.")
+if auto:
+    @st.fragment(run_every="60s")
+    def live_panel():
+        render_scan()
+    live_panel()
 else:
-    st.write("Ingen skanning genomförd ännu.")
+    if st.button("🔎 Skanna nu",type="primary"):
+        render_scan()
+    elif st.session_state.scan_data:
+        df=pd.DataFrame(st.session_state.scan_data)
+        st.dataframe(df,use_container_width=True,hide_index=True)
+    else:
+        st.info("Slå på automatisk uppdatering eller tryck på Skanna nu.")
 
 st.subheader("Paper trading")
-st.write("Denna första 3.0-version skannar och rangordnar signaler men öppnar inte automatiska positioner ännu. Det är avsiktligt: korrekt SEK-konvertering, spread, avgifter, stop-loss och risk per instrument måste verifieras innan automatiska scalping-affärer aktiveras.")
-st.subheader("Historik")
-hist=pd.read_sql_query("SELECT * FROM trades ORDER BY id DESC LIMIT 100",conn)
-if hist.empty: st.write("Ingen handelshistorik ännu.")
-else: st.dataframe(hist,use_container_width=True,hide_index=True)
-st.caption("Datakällor: Binance public 1m candles för krypto; Yahoo Finance inofficiella 1m chart endpoint för övriga marknader. Data kan saknas, vara fördröjd eller blockeras. SQLite på gratis molnlagring är inte garanterat beständig och kan rensas vid omstart/deploy.")
+st.write("Automatiska paper trades är avstängda tills positionsstorlek i SEK, valutakonvertering, spread, avgifter och stop-loss har verifierats. Signaluppdatering är inte samma sak som orderexekvering.")
+st.caption("Datakällor: OKX publika 1m candles med Bybit som reserv för krypto; Yahoo Finances inofficiella 1m chart endpoint för övriga marknader. Data kan saknas/fördröjas. Streamlit Cloud är inte en garanterad 24/7-bakgrundstjänst.")
