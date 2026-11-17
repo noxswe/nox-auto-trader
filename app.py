@@ -5,9 +5,9 @@ import sqlite3
 from datetime import datetime, timezone
 import math
 
-st.set_page_config(page_title="NOX AUTO TRADER 3.5", page_icon="📈", layout="wide")
-st.title("📈 NOX AUTO TRADER 3.5")
-st.caption("Balanced crypto scalping · 1m entries + 5m trend filter · 500 SEK · max 2% risk · No leverage")
+st.set_page_config(page_title="NOX AUTO TRADER 3.6", page_icon="📈", layout="wide")
+st.title("📈 NOX AUTO TRADER 3.6")
+st.caption("Balanced crypto scalping · 15 spot pairs · 1m entries + 5m trend filter · 500 SEK · max 2% risk")
 st.warning("PAPER TRADING ENDAST. Inga riktiga order eller pengar används. Balanced scalping med 1m-inträde och 5m-trendfilter. Strategin är experimentell och 40 % vinstaffärer är ett testmål, inte en garanti.")
 
 # Risk and execution assumptions
@@ -25,17 +25,25 @@ MAX_ATR_PCT = 0.012
 MIN_NOTIONAL_SEK = 20.0
 MAX_HOLD_MINUTES = 90
 
-DB = "nox_v33_paper.sqlite"  # Keep existing paper account and open positions
-HEADERS = {"User-Agent": "Mozilla/5.0 NOX-Auto-Trader/3.5"}
+DB = "nox_v35_paper_fresh.sqlite"  # Fresh 3.5 paper account; old 3.3/3.4 history is not loaded
+HEADERS = {"User-Agent": "Mozilla/5.0 NOX-Auto-Trader/3.6"}
 OKX_URL = "https://www.okx.com/api/v5/market/candles"
 BYBIT_URL = "https://api.bybit.com/v5/market/kline"
 FX_URL = "https://open.er-api.com/v6/latest/USD"
 YAHOO_URL = "https://query1.finance.yahoo.com/v8/finance/chart/"
 
 CRYPTO = [
+    # Core high-liquidity pairs
     ("BTC-USDT","BTCUSDT"), ("ETH-USDT","ETHUSDT"),
     ("SOL-USDT","SOLUSDT"), ("BNB-USDT","BNBUSDT"),
-    ("XRP-USDT","XRPUSDT")
+    ("XRP-USDT","XRPUSDT"),
+    # Expanded watchlist. Each instrument is checked against public exchange APIs;
+    # unavailable symbols are shown as data errors and are not traded.
+    ("DOGE-USDT","DOGEUSDT"), ("ADA-USDT","ADAUSDT"),
+    ("LINK-USDT","LINKUSDT"), ("LTC-USDT","LTCUSDT"),
+    ("AVAX-USDT","AVAXUSDT"), ("DOT-USDT","DOTUSDT"),
+    ("BCH-USDT","BCHUSDT"), ("TRX-USDT","TRXUSDT"),
+    ("SUI-USDT","SUIUSDT"), ("TON-USDT","TONUSDT")
 ]
 OTHER = [
     ("AAPL","Aktie"),("MSFT","Aktie"),("NVDA","Aktie"),("AMZN","Aktie"),
